@@ -8,7 +8,7 @@ use qdrant_client::Qdrant;
 mod routes;
 mod db;
 mod utils;
-// mod services;
+mod services;
 mod errors;
 
 use db::{init_db, run_migrations};
@@ -119,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .nest("/api", routes::chatbot::create_chatbot_router())
+        .nest("/api", routes::knowledge::create_knowledge_router())
         .with_state(app_state);
 
     // Run server
