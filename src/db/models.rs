@@ -34,6 +34,15 @@ pub struct Conversation {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ChatBot {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub status: String,
+}
+
 // Request/Response DTOs for API
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateSessionRequest {
@@ -56,6 +65,16 @@ pub struct CreateConversationRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateConversationRequest {
     pub bot_response: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateChatBotRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateChatBotRequest {
+    pub name: String,
 }
 
 // Response DTOs
@@ -87,6 +106,15 @@ pub struct ConversationResponse {
     pub sequence_number: i32,
     pub user_query: String,
     pub bot_response: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatBotResponse {
+    pub id: Uuid,
+    pub name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub status: String,

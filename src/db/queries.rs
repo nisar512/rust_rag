@@ -146,3 +146,57 @@ pub async fn list_conversations_by_session(pool: &PgPool, session_id: Uuid) -> A
     
     Ok(conversations)
 }
+
+// ChatBot queries
+pub async fn create_chat_bot(pool: &PgPool, name: String) -> AppResult<ChatBot> {
+    let chat_bot = sqlx::query_as::<_, ChatBot>(
+        "INSERT INTO chat_bot (name) VALUES ($1) RETURNING *"
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await?;
+    
+    Ok(chat_bot)
+}
+
+pub async fn get_chat_bot(pool: &PgPool, chat_bot_id: Uuid) -> AppResult<Option<ChatBot>> {
+    let chat_bot = sqlx::query_as::<_, ChatBot>(
+        "SELECT * FROM chat_bot WHERE id = $1 AND status = 'active'"
+    )
+    .bind(chat_bot_id)
+    .fetch_optional(pool)
+    .await?;
+    
+    Ok(chat_bot)
+}
+
+pub async fn list_chat_bots(pool: &PgPool) -> AppResult<Vec<ChatBot>> {
+    let chat_bots = sqlx::query_as::<_, ChatBot>(
+        "SELECT * FROM chat_bot WHERE status = 'active' ORDER BY created_at ASC"
+    )
+    .fetch_all(pool)
+    .await?;
+    
+    Ok(chat_bots)
+}
+
+pub async fn update_chat_bot(pool: &PgPool, chat_bot_id: Uuid, name: String) -> AppResult<ChatBot> {
+    let chat_bot = sqlx::query_as::<_, ChatBot>(
+        "UPDATE chat_bot SET name = $1 WHERE id = $2 AND status = 'active' RETURNING *"
+    )
+    .bind(name)
+    .bind(chat_bot_id)
+    .fetch_one(pool)
+    .await?;
+    
+    Ok(chat_bot)
+}
+
+pub async fn delete_chat_bot(pool: &PgPool, chat_bot_id: Uuid) -> AppResult<()> {
+    sqlx::query("UPDATE chat_bot SET status = 'deleted' WHERE id = $1")
+        .bind(chat_bot_id)
+        .execute(pool)
+        .await?;
+    
+    Ok(())
+}

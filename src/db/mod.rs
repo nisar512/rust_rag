@@ -51,6 +51,14 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
         UNIQUE(chat_id, sequence_number)
     )").execute(pool).await?;
     
+    sqlx::query("CREATE TABLE IF NOT EXISTS chat_bot (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'deleted'))
+    )").execute(pool).await?;
+    
     // Create indexes
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_chats_session_id ON chats(session_id)")
         .execute(pool).await?;
@@ -61,6 +69,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_conversations_sequence ON conversations(chat_id, sequence_number)")
         .execute(pool).await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_conversations_created_at ON conversations(created_at)")
+        .execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_chat_bot_name ON chat_bot(name)")
         .execute(pool).await?;
     
     // Create function and triggers
@@ -87,6 +97,12 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     sqlx::query("DROP TRIGGER IF EXISTS update_conversations_updated_at ON conversations")
         .execute(pool).await?;
     sqlx::query("CREATE TRIGGER update_conversations_updated_at BEFORE UPDATE ON conversations
+        FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()")
+        .execute(pool).await?;
+    
+    sqlx::query("DROP TRIGGER IF EXISTS update_chat_bot_updated_at ON chat_bot")
+        .execute(pool).await?;
+    sqlx::query("CREATE TRIGGER update_chat_bot_updated_at BEFORE UPDATE ON chat_bot
         FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()")
         .execute(pool).await?;
     
