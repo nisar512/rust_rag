@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     // Define routes
     let app = Router::new()
         .route("/health", get(health_handler))
+        .nest("/api", routes::chatbot::create_chatbot_router())
         .with_state(app_state);
 
     // Run server
