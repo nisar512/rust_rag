@@ -11,7 +11,7 @@ mod utils;
 // mod services;
 mod errors;
 
-use db::init_db;
+use db::{init_db, run_migrations};
 use utils::config::AppState;
 
 #[tokio::main]
@@ -31,6 +31,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Connecting to database...");
     let pool = init_db().await?;
     tracing::info!("✅ Database connected successfully");
+    
+    // Run database migrations
+    run_migrations(&pool).await?;
 
     tracing::info!("Connecting to Qdrant...");
     let qdrant_url = std::env::var("QDRANT_URL").unwrap_or("http://localhost:6333".to_string());
