@@ -2,6 +2,9 @@ use crate::errors::AppResult;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
+use tokio_stream::StreamExt;
+use futures_util::{Stream, stream};
+use std::pin::Pin;
 
 #[derive(Debug, Serialize)]
 struct GeminiRequest {
@@ -41,14 +44,33 @@ struct Candidate {
 }
 
 #[derive(Debug, Deserialize)]
+struct ResponsePart {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ResponseContent {
     parts: Vec<ResponsePart>,
     role: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponsePart {
-    text: String,
+struct StreamingCandidate {
+    content: ResponseContent,
+    #[serde(rename = "finishReason")]
+    finish_reason: Option<String>,
+    index: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamingResponse {
+    candidates: Vec<StreamingCandidate>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StreamingChunk {
+    pub text: String,
+    pub is_final: bool,
 }
 
 pub struct GeminiService {
@@ -135,5 +157,41 @@ impl GeminiService {
         tracing::info!("✅ Generated response from Gemini API");
 
         Ok(response_text)
+    }
+
+    pub async fn generate_response_stream(
+        &self,
+        user_query: &str,
+        context: &str,
+    ) -> AppResult<Pin<Box<dyn Stream<Item = AppResult<StreamingChunk>> + Send>>> {
+        // For now, we'll simulate streaming by getting the full response and chunking it
+        // This is a fallback until we implement proper Gemini streaming
+        let full_response = self.generate_response(user_query, context).await?;
+        
+        // Split response into words and stream them
+        let words: Vec<String> = full_response.split_whitespace().map(|s| s.to_string()).collect();
+        let word_index = 0;
+        
+        let stream = stream::unfold((words, word_index), |(words, index)| async move {
+            if index >= words.len() {
+                return None;
+            }
+            
+            let chunk_size = 3; // Send 3 words at a time
+            let end_index = (index + chunk_size).min(words.len());
+            let chunk_text = words[index..end_index].join(" ");
+            
+            let is_final = end_index >= words.len();
+            
+            Some((
+                Ok(StreamingChunk {
+                    text: chunk_text,
+                    is_final,
+                }),
+                (words, end_index),
+            ))
+        });
+        
+        Ok(Box::pin(stream))
     }
 }

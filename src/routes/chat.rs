@@ -1,13 +1,15 @@
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::Json,
+    response::{Json, Sse},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
+use futures_util::Stream;
+use axum::response::sse::{Event, KeepAlive};
 
 use crate::db::queries::{
     create_chat, create_conversation, create_session, get_chat, get_session,
@@ -16,6 +18,7 @@ use crate::db::queries::{
 use crate::services::embedding::EmbeddingService;
 use crate::services::gemini::GeminiService;
 use crate::utils::config::AppState;
+use futures_util::StreamExt;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -274,6 +277,192 @@ pub async fn chat_handler(
     })))
 }
 
+// Streaming chat endpoint
+pub async fn chat_stream_handler(
+    State(app_state): State<AppState>,
+    Json(payload): Json<ChatRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, axum::Error>>>, StatusCode> {
+    tracing::info!("Processing streaming chat request: {}", payload.query);
+
+    // Parse chatbot_id
+    let chatbot_id = Uuid::parse_str(&payload.chatbot_id).map_err(|e| {
+        tracing::error!("Invalid chatbot_id format: {}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+
+    // Handle session_id - create new if not provided
+    let session_id = match payload.session_id {
+        Some(session_id_str) => {
+            let session_uuid = Uuid::parse_str(&session_id_str).map_err(|e| {
+                tracing::error!("Invalid session_id format: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+            
+            // Verify session exists
+            match get_session(&app_state.db, session_uuid).await {
+                Ok(Some(_)) => session_uuid,
+                Ok(None) => {
+                    tracing::error!("Session not found: {}", session_uuid);
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to get session: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+        None => {
+            // Create new session
+            match create_session(&app_state.db).await {
+                Ok(session) => {
+                    tracing::info!("Created new session: {}", session.id);
+                    session.id
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create session: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+    };
+
+    // Handle chat_id - create new if not provided
+    let chat_id = match payload.chat_id {
+        Some(chat_id_str) => {
+            let chat_uuid = Uuid::parse_str(&chat_id_str).map_err(|e| {
+                tracing::error!("Invalid chat_id format: {}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+            
+            // Verify chat exists
+            match get_chat(&app_state.db, chat_uuid).await {
+                Ok(Some(_)) => chat_uuid,
+                Ok(None) => {
+                    tracing::error!("Chat not found: {}", chat_uuid);
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to get chat: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+        None => {
+            // Create new chat
+            match create_chat(&app_state.db, session_id, "New Chat".to_string()).await {
+                Ok(chat) => {
+                    tracing::info!("Created new chat: {}", chat.id);
+                    chat.id
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create chat: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+    };
+
+    // Create embedding service
+    let embedding_service = EmbeddingService::new(app_state.elasticsearch.clone()).map_err(|e| {
+        tracing::error!("Failed to create embedding service: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Create collection name for this chatbot
+    let collection_name = format!("chatbot_{}", chatbot_id);
+
+    // Search for similar embeddings to get context
+    let search_results = embedding_service.search_similar(&collection_name, &payload.query, 5).await.map_err(|e| {
+        tracing::error!("Failed to search embeddings: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    tracing::info!("Found {} similar results for query", search_results.len());
+
+    // Prepare context from search results
+    let context: String = search_results
+        .iter()
+        .map(|result| format!("Document: {}\nContent: {}", result.file_path, result.text))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // Get conversation history for context (last 5 messages only)
+    let conversations = list_last_conversations_by_chat(&app_state.db, chat_id, 5).await.map_err(|e| {
+        tracing::error!("Failed to get conversation history: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Build conversation history context (limited to last 5 messages for efficiency)
+    let conversation_history: String = conversations
+        .iter()
+        .map(|conv| {
+            format!(
+                "User: {}\nBot: {}",
+                conv.user_query,
+                conv.bot_response.as_ref().unwrap_or(&"".to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // Create conversation record
+    let conversation = create_conversation(
+        &app_state.db,
+        session_id,
+        chat_id,
+        payload.query.clone(),
+    ).await.map_err(|e| {
+        tracing::error!("Failed to create conversation: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Generate streaming response using Gemini
+    let gemini_service = GeminiService::new().map_err(|e| {
+        tracing::error!("Failed to create Gemini service: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Combine context and conversation history
+    let full_context = if !conversation_history.is_empty() {
+        format!("Previous conversation:\n{}\n\nRelevant documents:\n{}", conversation_history, context)
+    } else {
+        format!("Relevant documents:\n{}", context)
+    };
+
+    // Create streaming response
+    let stream = gemini_service.generate_response_stream(&payload.query, &full_context).await.map_err(|e| {
+        tracing::error!("Failed to create streaming response: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Convert to SSE events
+    let sse_stream = stream.map(move |chunk_result| {
+        match chunk_result {
+            Ok(chunk) => {
+                let event_data = json!({
+                    "text": chunk.text,
+                    "is_final": chunk.is_final,
+                    "session_id": session_id,
+                    "chat_id": chat_id,
+                    "conversation_id": conversation.id
+                });
+                
+                Ok(Event::default().data(event_data.to_string()))
+            }
+            Err(e) => {
+                tracing::error!("Streaming error: {}", e);
+                let error_data = json!({
+                    "error": e.to_string(),
+                    "is_final": true
+                });
+                Ok(Event::default().data(error_data.to_string()))
+            }
+        }
+    });
+
+    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+}
+
 // Get conversation history for a chat
 pub async fn get_chat_history_handler(
     State(app_state): State<AppState>,
@@ -317,6 +506,18 @@ pub async fn get_chat_history_handler(
     }
 }
 
+// Test SSE endpoint
+pub async fn test_sse_handler() -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+    let stream = futures_util::stream::iter(vec![
+        Ok(Event::default().data("Hello")),
+        Ok(Event::default().data("World")),
+        Ok(Event::default().data("Streaming")),
+        Ok(Event::default().data("Test")),
+    ]);
+    
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 // Health check for chat service
 pub async fn chat_health_handler() -> Json<Value> {
     Json(json!({
@@ -330,6 +531,8 @@ pub async fn chat_health_handler() -> Json<Value> {
 pub fn create_chat_router() -> Router<AppState> {
     Router::new()
         .route("/chat", post(chat_handler))
+        .route("/chat/stream", post(chat_stream_handler))
+        .route("/chat/test-sse", get(test_sse_handler))
         .route("/chat/session", post(create_session_handler))
         .route("/chat/history", get(get_chat_history_handler))
         .route("/chat/health", get(chat_health_handler))
