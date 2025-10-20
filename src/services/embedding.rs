@@ -1,74 +1,44 @@
 use anyhow::Result;
-use embed_anything::{
-    embed_file,
-    embeddings::embed::{Embedder, TextEmbedder},
-    embeddings::local::bert::BertEmbedder,
-};
-use qdrant_client::{
-    qdrant::{
-        vectors_config::Config,
-        CreateCollection, Distance, PointStruct, VectorParams, VectorsConfig,
-        SearchPoints,
-    },
-    Qdrant,
-};
+use elasticsearch::Elasticsearch;
 use std::path::PathBuf;
-use std::collections::HashMap;
+use std::sync::Arc;
 use tracing;
 use uuid::Uuid;
 
+use crate::services::candle_embedding::{CandleEmbeddingService, EmbeddingConfig};
+use crate::services::elasticsearch::{DocumentWithEmbedding, ElasticsearchService};
+use crate::utils::pdf::process_pdf_file;
+
 pub struct EmbeddingService {
-    qdrant: Qdrant,
+    elasticsearch_service: ElasticsearchService,
+    candle_service: CandleEmbeddingService,
 }
 
 impl EmbeddingService {
-    pub fn new(qdrant: &Qdrant) -> Result<Self> {
+    pub fn new(elasticsearch: Arc<Elasticsearch>) -> Result<Self> {
+        tracing::info!("Initializing EmbeddingService with Elasticsearch backend");
+        
+        // Initialize Candle embedding service
+        let config = EmbeddingConfig {
+            model_name: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            max_length: 512,
+            embedding_dim: 384,
+        };
+        
+        let candle_service = CandleEmbeddingService::new(Some(config))?;
+        let elasticsearch_service = ElasticsearchService::new(elasticsearch);
+        
         Ok(Self {
-            qdrant: qdrant.clone(),
+            elasticsearch_service,
+            candle_service,
         })
     }
 
-    // Create a collection for a chatbot if it doesn't exist
+    // Create an index for a chatbot if it doesn't exist
     pub async fn create_collection_if_not_exists(&self, collection_name: &str) -> Result<()> {
-        tracing::info!("Checking if collection '{}' exists", collection_name);
-
-        // Check if collection exists
-        match self.qdrant.list_collections().await {
-            Ok(collections) => {
-                let exists = collections
-                    .collections
-                    .iter()
-                    .any(|c| c.name == collection_name);
-
-                if exists {
-                    tracing::info!("Collection '{}' already exists", collection_name);
-                    return Ok(());
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to list collections: {}", e);
-            }
-        }
-
-        // Create collection
-        tracing::info!("Creating collection '{}'", collection_name);
-        
-        let collection_config = CreateCollection {
-            collection_name: collection_name.to_string(),
-            vectors_config: Some(VectorsConfig {
-                config: Some(Config::Params(VectorParams {
-                    size: 384, // BERT embedding size
-                    distance: Distance::Cosine as i32,
-                    ..Default::default()
-                })),
-            }),
-            ..Default::default()
-        };
-
-        self.qdrant.create_collection(collection_config).await?;
-        tracing::info!("✅ Collection '{}' created successfully", collection_name);
-
-        Ok(())
+        self.elasticsearch_service
+            .create_index_if_not_exists(collection_name, self.candle_service.embedding_dim())
+            .await
     }
 
     // Process PDF file and create embeddings
@@ -79,38 +49,47 @@ impl EmbeddingService {
     ) -> Result<usize> {
         tracing::info!("Processing PDF file: {:?}", file_path);
 
-        // For now, let's create a simple test implementation
-        // We'll need to debug the actual embed_anything structure
-        tracing::warn!("PDF processing temporarily disabled - need to debug embed_anything structure");
+        // Extract text from PDF and chunk it
+        let chunks = process_pdf_file(file_path, 200, 50)?; // 200 words per chunk, 50 word overlap
         
-        // Create a dummy embedding for testing
-        let dummy_embedding = vec![0.1; 384]; // BERT embedding size
-        
-        // Create a test point
-        let point = PointStruct {
-            id: Some(Uuid::new_v4().to_string().into()),
-            vectors: Some(dummy_embedding.into()),
-            payload: {
-                let mut payload = HashMap::new();
-                payload.insert("text".to_string(), "Test PDF content".to_string().into());
-                payload.insert("chunk_index".to_string(), 0i64.into());
-                payload.insert("file_path".to_string(), file_path.to_string_lossy().to_string().into());
-                payload
-            },
-            ..Default::default()
-        };
+        if chunks.is_empty() {
+            tracing::warn!("No text chunks extracted from PDF");
+            return Ok(0);
+        }
 
-        // Insert the test point
-        let upsert_points = qdrant_client::qdrant::UpsertPoints {
-            collection_name: collection_name.to_string(),
-            points: vec![point],
-            ..Default::default()
-        };
+        tracing::info!("Extracted {} text chunks from PDF", chunks.len());
 
-        self.qdrant.upsert_points(upsert_points).await?;
+        // Generate embeddings for all chunks
+        let embeddings = self.candle_service.embed_texts(&chunks)?;
         
-        tracing::info!("✅ Successfully stored test embedding in collection '{}'", collection_name);
-        Ok(1)
+        if embeddings.len() != chunks.len() {
+            tracing::error!("Mismatch between chunks ({}) and embeddings ({})", chunks.len(), embeddings.len());
+            return Err(anyhow::anyhow!("Embedding generation failed"));
+        }
+
+        // Create documents for Elasticsearch
+        let mut documents = Vec::new();
+        
+        for (i, (chunk, embedding)) in chunks.iter().zip(embeddings.iter()).enumerate() {
+            let document = DocumentWithEmbedding {
+                id: Uuid::new_v4().to_string(),
+                text: chunk.clone(),
+                embedding: embedding.clone(),
+                chunk_index: i as i64,
+                file_path: file_path.to_string_lossy().to_string(),
+                chunk_count: chunks.len() as i64,
+            };
+            documents.push(document);
+        }
+
+        // Index all documents in Elasticsearch
+        let indexed_count = self.elasticsearch_service
+            .index_documents(collection_name, documents)
+            .await?;
+        
+        tracing::info!("✅ Successfully stored {} embeddings in index '{}'", indexed_count, collection_name);
+        
+        Ok(indexed_count)
     }
 
     // Search for similar embeddings
@@ -119,25 +98,24 @@ impl EmbeddingService {
         collection_name: &str,
         query_text: &str,
         limit: u64,
-    ) -> Result<Vec<qdrant_client::qdrant::ScoredPoint>> {
-        tracing::info!("Searching for similar embeddings in collection '{}'", collection_name);
+    ) -> Result<Vec<crate::services::elasticsearch::SearchResult>> {
+        tracing::info!("Searching for similar embeddings in index '{}'", collection_name);
 
-        // For now, create a dummy query vector
-        let query_vector = vec![0.1; 384]; // BERT embedding size
+        // Generate embedding for the query text
+        let query_embedding = self.candle_service.embed_text(query_text)?;
 
-        // Search in Qdrant
-        let search_points = SearchPoints {
-            collection_name: collection_name.to_string(),
-            vector: query_vector,
-            limit,
-            with_payload: Some(true.into()),
-            ..Default::default()
-        };
-
-        let search_result = self.qdrant.search_points(search_points).await?;
+        // Search in Elasticsearch
+        let search_results = self.elasticsearch_service
+            .search_similar(collection_name, query_embedding, limit)
+            .await?;
         
-        tracing::info!("Found {} similar points", search_result.result.len());
+        tracing::info!("Found {} similar documents", search_results.len());
 
-        Ok(search_result.result)
+        Ok(search_results)
+    }
+
+    // Get embedding dimension
+    pub fn embedding_dim(&self) -> usize {
+        self.candle_service.embedding_dim()
     }
 }

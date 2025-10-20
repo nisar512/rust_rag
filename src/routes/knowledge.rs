@@ -98,20 +98,33 @@ pub async fn upload_pdf_handler(
 
     tracing::info!("File saved to temp location: {:?}", temp_file_path);
 
-    // For now, skip the embedding processing and just return success
+    // Process PDF and create embeddings using Candle
+    let embedding_count = match process_pdf_and_create_embeddings(&app_state, chatbot_id, &temp_file_path, &file_name).await {
+        Ok(count) => {
+            tracing::info!("✅ Successfully processed PDF and created {} embeddings", count);
+            count
+        }
+        Err(e) => {
+            tracing::error!("❌ Failed to process PDF: {}", e);
+            // Clean up temp file
+            let _ = fs::remove_file(&temp_file_path).await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
     // Clean up temp file
     let _ = fs::remove_file(&temp_file_path).await;
     
-    tracing::info!("✅ PDF upload successful (embedding processing temporarily disabled)");
+    tracing::info!("✅ PDF upload and processing completed successfully");
     
     Ok(Json(json!({
         "success": true,
-        "message": "PDF uploaded successfully (embedding processing temporarily disabled)",
+        "message": "PDF uploaded and processed successfully",
         "data": {
             "chatbot_id": chatbot_id,
             "file_name": file_name,
-            "embedding_count": 0,
-            "note": "Embedding processing will be implemented once embed_anything structure is debugged"
+            "embedding_count": embedding_count,
+            "note": "PDF processed using Candle ML framework"
         }
     })))
 }
@@ -126,7 +139,7 @@ async fn process_pdf_and_create_embeddings(
     tracing::info!("Starting PDF processing for chatbot: {}", chatbot_id);
 
     // Create embedding service
-    let embedding_service = EmbeddingService::new(&app_state.qdrant)?;
+    let embedding_service = EmbeddingService::new(app_state.elasticsearch.clone())?;
     
     // Create collection name for this chatbot
     let collection_name = format!("chatbot_{}", chatbot_id);

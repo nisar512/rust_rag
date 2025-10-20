@@ -3,7 +3,7 @@ use dotenv::dotenv;
 use std::{net::SocketAddr, sync::Arc};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use serde_json::{json, Value};
-use qdrant_client::Qdrant;
+use elasticsearch::{Elasticsearch, http::transport::Transport};
 
 mod routes;
 mod db;
@@ -35,75 +35,64 @@ async fn main() -> anyhow::Result<()> {
     // Run database migrations
     run_migrations(&pool).await?;
 
-    tracing::info!("Connecting to Qdrant...");
-    let qdrant_url = std::env::var("QDRANT_URL").unwrap_or("http://localhost:6333".to_string());
+    tracing::info!("Connecting to Elasticsearch...");
+    let elasticsearch_url = std::env::var("ELASTICSEARCH_URL").unwrap_or("http://localhost:9200".to_string());
     
-    // Build Qdrant client - try simple approach first
-    let qdrant_client = Qdrant::from_url(&qdrant_url).build()?;
+    // Build Elasticsearch client
+    let transport = Transport::single_node(&elasticsearch_url)?;
+    let elasticsearch_client = Elasticsearch::new(transport);
     
-    // Test Qdrant connection - server will fail to start if this fails
-    tracing::info!("Testing Qdrant connection...");
+    // Test Elasticsearch connection - server will fail to start if this fails
+    tracing::info!("Testing Elasticsearch connection...");
     
-    // Try multiple connection methods to handle HTTP/2 issues
     let mut connection_verified = false;
     
-    // Method 1: Try health check
-    match qdrant_client.health_check().await {
-        Ok(_) => {
-            tracing::info!("✅ Qdrant health check passed");
+    // Try ping check
+    match elasticsearch_client.ping().send().await {
+        Ok(response) if response.status_code().is_success() => {
+            tracing::info!("✅ Elasticsearch ping successful");
             connection_verified = true;
         },
+        Ok(response) => {
+            tracing::warn!("⚠️ Elasticsearch ping returned status: {}", response.status_code());
+        },
         Err(e) => {
-            tracing::warn!("⚠️ Qdrant health check failed: {}", e);
+            tracing::warn!("⚠️ Elasticsearch ping failed: {}", e);
         }
     }
     
-    // Method 2: Try collections list if health check failed
+    // Try alternative connection test if ping failed
     if !connection_verified {
         tracing::info!("Trying alternative connection test...");
-        match qdrant_client.list_collections().await {
-            Ok(_) => {
-                tracing::info!("✅ Qdrant connection verified via collections list");
-                connection_verified = true;
-            },
-            Err(e) => {
-                tracing::warn!("⚠️ Collections list also failed: {}", e);
-            }
-        }
-    }
-    
-    // Method 3: Try simple HTTP request as last resort
-    if !connection_verified {
-        tracing::info!("Trying direct HTTP connection test...");
-        match reqwest::get(&format!("{}/collections", qdrant_url)).await {
-            Ok(response) if response.status().is_success() => {
-                tracing::info!("✅ Qdrant HTTP connection verified");
+        match elasticsearch_client.cat().health().send().await {
+            Ok(response) if response.status_code().is_success() => {
+                tracing::info!("✅ Elasticsearch cat health successful");
                 connection_verified = true;
             },
             Ok(response) => {
-                tracing::warn!("⚠️ HTTP test returned status: {}", response.status());
+                tracing::warn!("⚠️ Elasticsearch cat health returned status: {}", response.status_code());
             },
             Err(e) => {
-                tracing::warn!("⚠️ HTTP test failed: {}", e);
+                tracing::warn!("⚠️ Elasticsearch cat health failed: {}", e);
             }
         }
     }
     
     // Final check - fail if no method worked
     if !connection_verified {
-        tracing::error!("❌ All Qdrant connection tests failed");
-        tracing::error!("Server cannot start without Qdrant connection");
-        tracing::error!("Please ensure Qdrant is running on {}", qdrant_url);
-        tracing::error!("Try: docker run -p 6333:6333 qdrant/qdrant");
-        return Err(anyhow::anyhow!("Qdrant connection failed - all connection methods failed"));
+        tracing::error!("❌ All Elasticsearch connection tests failed");
+        tracing::error!("Server cannot start without Elasticsearch connection");
+        tracing::error!("Please ensure Elasticsearch is running on {}", elasticsearch_url);
+        tracing::error!("Try: docker run -p 9200:9200 -e 'discovery.type=single-node' elasticsearch:8.15.0");
+        return Err(anyhow::anyhow!("Elasticsearch connection failed - all connection methods failed"));
     }
     
-    tracing::info!("✅ Qdrant connection verified successfully");
+    tracing::info!("✅ Elasticsearch connection verified successfully");
 
     // Shared application state
     let app_state = AppState {
         db: Arc::new(pool),
-        qdrant: Arc::new(qdrant_client),
+        elasticsearch: Arc::new(elasticsearch_client),
     };
 
     // Health check handler
@@ -120,6 +109,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health_handler))
         .nest("/api", routes::chatbot::create_chatbot_router())
         .nest("/api", routes::knowledge::create_knowledge_router())
+        .nest("/api", routes::query::create_query_router())
+        .nest("/api", routes::chat::create_chat_router())
         .with_state(app_state);
 
     // Run server
