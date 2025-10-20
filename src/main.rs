@@ -4,6 +4,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use serde_json::{json, Value};
 use elasticsearch::{Elasticsearch, http::transport::Transport};
+use tower_http::cors::{CorsLayer, Any};
 
 mod routes;
 mod db;
@@ -111,6 +112,12 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api", routes::knowledge::create_knowledge_router())
         .nest("/api", routes::query::create_query_router())
         .nest("/api", routes::chat::create_chat_router())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        )
         .with_state(app_state);
 
     // Run server
