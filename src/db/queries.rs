@@ -136,6 +136,22 @@ pub async fn list_conversations_by_chat(pool: &PgPool, chat_id: Uuid) -> AppResu
     Ok(conversations)
 }
 
+pub async fn list_last_conversations_by_chat(pool: &PgPool, chat_id: Uuid, limit: i64) -> AppResult<Vec<Conversation>> {
+    let conversations = sqlx::query_as::<_, Conversation>(
+        "SELECT * FROM conversations WHERE chat_id = $1 AND status = 'active' ORDER BY sequence_number DESC LIMIT $2"
+    )
+    .bind(chat_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    
+    // Reverse to get chronological order (oldest first)
+    let mut conversations = conversations;
+    conversations.reverse();
+    
+    Ok(conversations)
+}
+
 pub async fn list_conversations_by_session(pool: &PgPool, session_id: Uuid) -> AppResult<Vec<Conversation>> {
     let conversations = sqlx::query_as::<_, Conversation>(
         "SELECT * FROM conversations WHERE session_id = $1 AND status = 'active' ORDER BY created_at ASC"

@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::db::queries::{
     create_chat, create_conversation, create_session, get_chat, get_session,
-    list_conversations_by_chat, update_conversation_response,
+    list_conversations_by_chat, list_last_conversations_by_chat, update_conversation_response,
 };
 use crate::services::embedding::EmbeddingService;
 use crate::services::gemini::GeminiService;
@@ -194,13 +194,13 @@ pub async fn chat_handler(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    // Get conversation history for context
-    let conversations = list_conversations_by_chat(&app_state.db, chat_id).await.map_err(|e| {
+    // Get conversation history for context (last 5 messages only)
+    let conversations = list_last_conversations_by_chat(&app_state.db, chat_id, 5).await.map_err(|e| {
         tracing::error!("Failed to get conversation history: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Build conversation history context
+    // Build conversation history context (limited to last 5 messages for efficiency)
     let conversation_history: String = conversations
         .iter()
         .map(|conv| {

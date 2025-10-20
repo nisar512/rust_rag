@@ -155,10 +155,16 @@ The chat system uses the following database tables:
 1. **Query Processing**: User sends a query to the chat endpoint
 2. **Session Management**: System creates or retrieves session/chat
 3. **Vector Search**: Query is embedded and searched against stored documents
-4. **Context Building**: Relevant documents and conversation history are combined
+4. **Context Building**: Relevant documents and last 5 conversation messages are combined
 5. **AI Generation**: Gemini AI generates a response based on the context
 6. **Storage**: Conversation is stored in the database
 7. **Response**: Structured response is returned to the user
+
+### Performance Optimizations
+
+- **Limited Context**: Only the last 5 conversation messages are used for context to optimize token usage and response time
+- **Vector Search**: Top 5 most relevant document chunks are retrieved
+- **Efficient Database Queries**: Optimized queries with proper indexing
 
 ## Error Handling
 
